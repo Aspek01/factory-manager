@@ -1,32 +1,21 @@
 ﻿# DATA CONTRACTS — LOCKED (V1)
 
-## 1. Part Type & Procurement Strategy
+## Part & Procurement
 - finished_good → MUST make
-- raw_material → MUST buy
-- consumable → MUST buy
-- fixed_asset → MUST buy
-- semi_finished → make OR buy (explicit seçim zorunlu)
+- raw_material / consumable / fixed_asset → MUST buy
+- semi_finished → make OR buy
 
-## 2. BOM Safety
+## BOM Safety
 - Max depth: 10
-- Circular reference kesinlikle yasak.
-- finished_good BOM component olamaz.
-- fixed_asset BOM component olamaz.
+- Circular reference YASAK
 
-## 3. Costing Method
-- Yalnızca WAC (Weighted Average Cost) kullanılır.
-- FIFO/LIFO/Specific yasaktır.
-- unit_cost alanı tüm stock-in hareketlerinde zorunludur.
+## Costing
+- Yalnızca WAC
+- unit_cost zorunlu
 
-## 4. QC Trigger Matrix
-- Incoming QC → GR created
-- In-process QC → operation.complete AND requires_inspection=true
-- Final QC → finished_good için zorunlu
-
-## 5. Lot & Release Invariants
-- WorkOrder release sonrası:
-  - lot_code immutable
-  - routing immutable
-- Release sonrası BOM veya routing değiştirilemez.
+## QC
+- Incoming QC → GR
+- In-process QC → requires_inspection
+- Final QC → finished_good
 
 STATUS: LOCKED
