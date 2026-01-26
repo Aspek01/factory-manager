@@ -1,0 +1,4 @@
+﻿Django>=5.0,<6.0
+python-dotenv
+psycopg[binary]
+dj-database-url
