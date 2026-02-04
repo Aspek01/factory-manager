@@ -206,3 +206,18 @@ class UserMembership(models.Model):
             if not self.workstation or self.facility or self.section:
                 raise ValidationError("operator must bind workstation only")
             return
+from apps.tenancy.managers import TenantManager
+
+
+class CompanyBoundModel(models.Model):
+    """
+    Abstract base for all tenant-bound domain models.
+    Enforces automatic ORM scoping via TenantManager.
+    """
+
+    company = models.ForeignKey(Company, on_delete=models.PROTECT, related_name="+")
+
+    objects = TenantManager()
+
+    class Meta:
+        abstract = True

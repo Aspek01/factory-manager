@@ -15,3 +15,10 @@ def set_active_scope(company_id, facility_id=None, section_id=None, workstation_
 
 def get_active_company_id():
     return active_company_id.get()
+
+
+def require_active_company_id() -> str:
+    company_id = active_company_id.get()
+    if not company_id:
+        raise RuntimeError("active_company_id is required for tenant-bound queries")
+    return company_id
