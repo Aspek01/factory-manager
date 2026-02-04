@@ -20,12 +20,21 @@ class TenantRBACMiddleware(MiddlewareMixin):
         membership = resolve_membership(request.user)
         apply_membership_scope(membership)
 
+        # Determine dynamic scope
+        scope = "COMPANY"
+        if membership.facility_id:
+            scope = "FACILITY"
+        if membership.section_id:
+            scope = "SECTION"
+        if membership.workstation_id:
+            scope = "WORKSTATION"
+
         # Audit: RBAC scope applied (append-only)
         audit_event(
             company_id=membership.company_id,
             actor_user_id=membership.user_id,
             event_type="rbac.scope.applied",
-            scope="COMPANY",
+            scope=scope,
             payload={
                 "role": membership.role,
                 "facility_id": membership.facility_id,
