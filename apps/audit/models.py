@@ -6,6 +6,7 @@ from django.db import models
 from django.core.exceptions import PermissionDenied
 
 from .guards import guard_event_name, guard_payload
+from .context import AUDIT_EMIT_ALLOWED
 
 
 class AuditEvent(models.Model):
@@ -29,6 +30,10 @@ class AuditEvent(models.Model):
         # Append-only: no updates (only inserts)
         if self.pk and not self._state.adding:
             raise PermissionDenied("AuditEvent is immutable (append-only)")
+
+        # EntryPoint lock: only emit_audit_event() may write
+        if not AUDIT_EMIT_ALLOWED.get():
+            raise PermissionDenied("AuditEvent writes must go through emit_audit_event()")
 
         # Model-level guards (bypass-resistant)
         guard_event_name(self.event_name)
