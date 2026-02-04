@@ -5,6 +5,8 @@ from uuid import uuid4
 from django.db import models
 from django.core.exceptions import PermissionDenied
 
+from .guards import guard_event_name, guard_payload
+
 
 class AuditEvent(models.Model):
     # Keep UUID PK aligned with existing DB
@@ -27,6 +29,11 @@ class AuditEvent(models.Model):
         # Append-only: no updates (only inserts)
         if self.pk and not self._state.adding:
             raise PermissionDenied("AuditEvent is immutable (append-only)")
+
+        # Model-level guards (bypass-resistant)
+        guard_event_name(self.event_name)
+        guard_payload(self.event_name, self.payload)
+
         return super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
