@@ -21,3 +21,9 @@ media/
 # --- OS ---
 .DS_Store
 Thumbs.db
+
+# --- Dev runtime artefacts (LOCKED) ---
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
