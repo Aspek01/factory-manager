@@ -1,20 +1,13 @@
-from __future__ import annotations
+# apps/audit/hooks.py
+from .models import AuditEvent
+from .guards import run_guards
 
-from apps.audit.models import AuditEvent
+def emit_audit_event(*, event_name: str, payload: dict, context, actor_id=None):
+    run_guards(event_name=event_name, payload=payload, context=context)
 
-
-def audit_event(
-    *,
-    company_id=None,
-    actor_user_id=None,
-    event_type: str,
-    scope: str,
-    payload: dict | None = None,
-):
-    AuditEvent.objects.create(
-        company_id=company_id,
-        actor_user_id=actor_user_id,
-        event_type=event_type,
-        scope=scope,
+    return AuditEvent.objects.create(
+        event_name=event_name,
+        company_id=context.company_id,
+        actor_id=actor_id,
         payload=payload or {},
     )
