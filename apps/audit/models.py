@@ -1,8 +1,15 @@
-# apps/audit/models.py
+from __future__ import annotations
+
+from uuid import uuid4
+
 from django.db import models
 from django.core.exceptions import PermissionDenied
 
+
 class AuditEvent(models.Model):
+    # Keep UUID PK aligned with existing DB
+    id = models.UUIDField(primary_key=True, default=uuid4, editable=False)
+
     event_name = models.CharField(max_length=128)
     company_id = models.UUIDField()
     actor_id = models.UUIDField(null=True, blank=True)
@@ -10,13 +17,15 @@ class AuditEvent(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
+        db_table = "audit_events"
         indexes = [
             models.Index(fields=["company_id", "created_at"]),
             models.Index(fields=["event_name", "created_at"]),
         ]
 
     def save(self, *args, **kwargs):
-        if self.pk:
+        # Append-only: no updates (only inserts)
+        if self.pk and not self._state.adding:
             raise PermissionDenied("AuditEvent is immutable (append-only)")
         return super().save(*args, **kwargs)
 

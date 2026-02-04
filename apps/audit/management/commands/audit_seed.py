@@ -1,45 +1,55 @@
 from __future__ import annotations
 
-from django.contrib.auth import get_user_model
+import os
+from uuid import UUID
+
 from django.core.management.base import BaseCommand
 
-from apps.audit.models import AuditEvent
-from apps.tenancy.models import Company, Facility, Section, Workstation, Role, UserMembership
-from apps.audit.hooks import audit_event
+from apps.audit.hooks import emit_audit_event
+
+
+class _SeedContext:
+    """
+    Minimal, deterministic context for audit guards.
+    Only requirement: company_id attribute.
+    """
+    def __init__(self, company_id):
+        self.company_id = company_id
 
 
 class Command(BaseCommand):
-    help = "Seeds minimal tenancy + membership and emits a sample audit event for verification."
+    help = (
+        "Emit a minimal audit event to verify append-only audit pipeline.\n"
+        "Requires environment variable: SEED_COMPANY_ID (UUID)."
+    )
 
     def handle(self, *args, **options):
-        User = get_user_model()
+        raw = (os.environ.get("SEED_COMPANY_ID") or "").strip()
+        if not raw:
+            raise RuntimeError(
+                "SEED_COMPANY_ID environment variable is required.\n"
+                "PowerShell example:\n"
+                "$env:SEED_COMPANY_ID='00000000-0000-0000-0000-000000000000'"
+            )
 
-        company, _ = Company.objects.get_or_create(name="Demo Company")
-        facility, _ = Facility.objects.get_or_create(company=company, name="Main Facility")
-        section, _ = Section.objects.get_or_create(company=company, facility=facility, name="Section A")
-        ws, _ = Workstation.objects.get_or_create(company=company, section=section, code="WS-01", defaults={"name": "Workstation 01"})
+        try:
+            company_id = UUID(raw)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Invalid SEED_COMPANY_ID (must be UUID): {raw}"
+            ) from exc
 
-        user, _ = User.objects.get_or_create(username="demo_cm", defaults={"email": "demo@example.com"})
-        user.set_password("demo12345")
-        user.save()
+        ctx = _SeedContext(company_id=company_id)
 
-        membership, _ = UserMembership.objects.get_or_create(
-            user=user,
-            defaults={
-                "company": company,
-                "role": Role.COMPANY_MANAGER,
-            },
+        emit_audit_event(
+            event_name="system.seed.executed",
+            payload={"by": "audit_seed"},
+            context=ctx,
+            actor_id=None,
         )
 
-        scope = "COMPANY"
-        audit_event(
-            company_id=membership.company_id,
-            actor_user_id=membership.user_id,
-            event_type="rbac.scope.applied",
-            scope=scope,
-            payload={"role": membership.role},
+        self.stdout.write(
+            self.style.SUCCESS(
+                "audit_seed OK — system.seed.executed emitted (append-only)"
+            )
         )
-
-        count = AuditEvent.objects.filter(company_id=company.id, event_type="rbac.scope.applied").count()
-        self.stdout.write(self.style.SUCCESS(f"OK: emitted rbac.scope.applied. total={count}"))
-        self.stdout.write(self.style.SUCCESS("Login: demo_cm / demo12345 (admin panel for viewing events)"))
