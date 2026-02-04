@@ -36,6 +36,7 @@ INSTALLED_APPS = [
     "apps.tenancy",
     "apps.audit",
     "apps.settings",
+    "apps.inventory",
     "apps.documents",
     "apps.notifications",
 ]
