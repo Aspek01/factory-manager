@@ -22,3 +22,6 @@ def require_active_company_id() -> str:
     if not company_id:
         raise RuntimeError("active_company_id is required for tenant-bound queries")
     return company_id
+
+def clear_active_scope():
+    set_active_scope(None)

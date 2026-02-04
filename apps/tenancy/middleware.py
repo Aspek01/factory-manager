@@ -1,19 +1,20 @@
-from django.http import JsonResponse
+from django.utils.deprecation import MiddlewareMixin
+
 from apps.tenancy.context import set_active_scope
+from apps.tenancy.rbac import resolve_membership, apply_membership_scope
 
 
-class TenantContextMiddleware:
+class TenantRBACMiddleware(MiddlewareMixin):
     """
-    LOCKED: active_company_id required on every request.
+    Resolves UserMembership and enforces role-based scope binding per request.
     """
 
-    def __init__(self, get_response):
-        self.get_response = get_response
+    def process_request(self, request):
+        # Reset scope per request
+        set_active_scope(None)
 
-    def __call__(self, request):
-        company_id = request.headers.get("X-Company-ID")
-        if not company_id:
-            return JsonResponse({"detail": "active_company_id is required"}, status=403)
+        if not request.user.is_authenticated:
+            return
 
-        set_active_scope(company_id=company_id)
-        return self.get_response(request)
+        membership = resolve_membership(request.user)
+        apply_membership_scope(membership)
