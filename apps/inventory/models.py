@@ -1,3 +1,4 @@
+# apps/inventory/models.py
 from __future__ import annotations
 
 from decimal import Decimal
@@ -5,6 +6,8 @@ from uuid import uuid4
 
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import models
+
+from apps.inventory.guards import assert_max_depth, assert_no_circular_bom
 
 
 class Part(models.Model):
@@ -32,8 +35,11 @@ class Part(models.Model):
 
     standard_cost = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
     last_purchase_price = models.DecimalField(
-        max_digits=12, decimal_places=4, null=True, blank=True,
-        help_text="Read-only (updated by GR/QC pass flow)."
+        max_digits=12,
+        decimal_places=4,
+        null=True,
+        blank=True,
+        help_text="Read-only (updated by GR/QC pass flow).",
     )
 
     created_at = models.DateTimeField(auto_now_add=True)
@@ -93,12 +99,23 @@ class BOM(models.Model):
 
     def clean(self):
         super().clean()
+
         if self.parent_part.part_type not in {Part.PartType.FINISHED_GOOD, Part.PartType.SEMI_FINISHED}:
             raise ValidationError("BOM parent must be finished_good or semi_finished")
 
+        # Company boundary safety (fail-fast)
+        if self.parent_part.company_id != self.company_id:
+            raise ValidationError("company_id mismatch between BOM and parent_part")
+
     def save(self, *args, **kwargs):
         self.full_clean()
-        return super().save(*args, **kwargs)
+        result = super().save(*args, **kwargs)
+
+        # Post-save graph validation (fail-fast)
+        assert_no_circular_bom(self.company_id, self.parent_part_id)
+        assert_max_depth(self.company_id, self.parent_part_id)
+
+        return result
 
 
 class BOMItem(models.Model):
@@ -133,12 +150,14 @@ class BOMItem(models.Model):
             raise ValidationError("BOM component cannot be finished_good or fixed_asset")
 
         if self.component_part.part_type == Part.PartType.CONSUMABLE and not self.is_direct:
-            # Indirect consumables are explicitly out of BOM per spec (handled later as controlled adjustment)
+            # Indirect consumables are explicitly out of BOM per spec
             raise ValidationError("Indirect consumables must not be BOM components (set is_direct=True)")
 
         # Company boundary safety (fail-fast)
-        if self.bom.company_id != self.company_id or self.component_part.company_id != self.company_id:
-            raise ValidationError("company_id mismatch across BOM/BOMItem/Part")
+        if self.bom.company_id != self.company_id:
+            raise ValidationError("company_id mismatch between BOMItem and BOM")
+        if self.component_part.company_id != self.company_id:
+            raise ValidationError("company_id mismatch between BOMItem and component_part")
 
     def save(self, *args, **kwargs):
         self.full_clean()
@@ -185,11 +204,13 @@ class StockLedgerEntry(models.Model):
         ]
 
     def save(self, *args, **kwargs):
-        # Append-only
+        # Append-only: update forbidden
         if self.pk and not self._state.adding:
             raise PermissionDenied("StockLedgerEntry is immutable (append-only)")
 
         # Company boundary safety
+        if self.part_id is None:
+            raise ValidationError("part is required")
         if self.part.company_id != self.company_id:
             raise ValidationError("company_id mismatch between StockLedgerEntry and Part")
 
@@ -200,7 +221,16 @@ class StockLedgerEntry(models.Model):
             raise ValidationError("qty is required")
 
         self.transaction_value = (Decimal(self.qty) * Decimal(self.unit_cost))
-        return super().save(*args, **kwargs)
+
+        is_new = self._state.adding
+        result = super().save(*args, **kwargs)
+
+        # IMPORTANT: local import to avoid circular import at startup
+        if is_new:
+            from apps.inventory.hooks import on_ledger_insert
+            on_ledger_insert(entry=self)
+
+        return result
 
     def delete(self, *args, **kwargs):
         raise PermissionDenied("StockLedgerEntry delete is forbidden (append-only)")

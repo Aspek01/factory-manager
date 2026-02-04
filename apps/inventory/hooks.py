@@ -1,0 +1,70 @@
+# apps/inventory/hooks.py
+from __future__ import annotations
+
+from decimal import Decimal
+from uuid import UUID
+
+from django.core.exceptions import ValidationError
+from django.db import transaction
+
+
+def on_ledger_insert(*, entry) -> None:
+    """
+    Update PartStockSummary after StockLedgerEntry insert.
+    - No model imports at module import time (prevents circular imports).
+    - Uses select_for_update for deterministic updates.
+    """
+    from apps.inventory.models import PartStockSummary, StockLedgerEntry  # local import
+
+    if not isinstance(entry, StockLedgerEntry):
+        raise ValidationError("on_ledger_insert: invalid entry type")
+
+    if entry.qty is None or entry.unit_cost is None:
+        raise ValidationError("on_ledger_insert: qty/unit_cost required")
+
+    company_id: UUID = entry.company_id
+    part_id: UUID = entry.part_id
+
+    qty = Decimal(entry.qty)
+    unit_cost = Decimal(entry.unit_cost)
+
+    with transaction.atomic():
+        summary, _ = PartStockSummary.objects.select_for_update().get_or_create(
+            company_id=company_id,
+            part_id=part_id,
+            defaults={
+                "available_qty": Decimal("0"),
+                "weighted_avg_cost": Decimal("0"),
+            },
+        )
+
+        old_qty = Decimal(summary.available_qty)
+        old_wac = Decimal(summary.weighted_avg_cost)
+
+        if entry.movement_type in ("in", "adjustment"):
+            new_qty = old_qty + qty
+            if new_qty < 0:
+                raise ValidationError("Stock summary cannot go negative")
+
+            # WAC update only on positive in-qty
+            if qty > 0:
+                total_value = (old_qty * old_wac) + (qty * unit_cost)
+                summary.weighted_avg_cost = (total_value / new_qty) if new_qty != 0 else Decimal("0")
+
+            summary.available_qty = new_qty
+
+            if entry.source_type == "purchase":
+                summary.last_purchase_cost = unit_cost
+            if entry.source_type == "production":
+                summary.last_production_cost = unit_cost
+
+        elif entry.movement_type == "out":
+            new_qty = old_qty - qty
+            if new_qty < 0:
+                raise ValidationError("Insufficient stock (would go negative)")
+            summary.available_qty = new_qty
+
+        else:
+            raise ValidationError(f"Unknown movement_type: {entry.movement_type}")
+
+        summary.save()
