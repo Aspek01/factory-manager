@@ -1,0 +1,14 @@
+services:
+  db:
+    image: postgres:16
+    container_name: fm_dev_db
+    environment:
+      POSTGRES_DB: factory_manager
+      POSTGRES_USER: fm
+      POSTGRES_PASSWORD: fm_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - fm_dev_pg:/var/lib/postgresql/data
+volumes:
+  fm_dev_pg:
