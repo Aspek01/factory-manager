@@ -18,3 +18,12 @@ def emit_audit_event(*, event_name: str, payload: dict, context, actor_id=None):
         )
     finally:
         AUDIT_EMIT_ALLOWED.reset(token)
+
+# --- COMPAT SHIM (tenancy middleware expects audit_event) ---
+def audit_event(*, event_name: str, payload: dict, context, actor_id=None):
+    return emit_audit_event(
+        event_name=event_name,
+        payload=payload,
+        context=context,
+        actor_id=actor_id,
+    )

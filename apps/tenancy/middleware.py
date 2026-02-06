@@ -16,6 +16,10 @@ class TenantRBACMiddleware(MiddlewareMixin):
 
         if not request.user.is_authenticated:
             return
+        
+       # Django admin should not be gated by tenancy membership
+        if request.path.startswith("/admin/"):
+            return
 
         membership = resolve_membership(request.user)
         apply_membership_scope(membership)
@@ -42,3 +46,16 @@ class TenantRBACMiddleware(MiddlewareMixin):
                 "workstation_id": membership.workstation_id,
             },
         )
+
+from django.utils.deprecation import MiddlewareMixin
+from apps.tenancy.context import set_active_scope
+
+class TenantContextMiddleware(MiddlewareMixin):
+    """
+    Minimal context reset middleware.
+    Ensures per-request tenancy context is clean before other middleware runs.
+    """
+    def process_request(self, request):
+        set_active_scope(None)
+        return None
+
