@@ -1,1 +1,1 @@
-# Intentionally empty.
+# Package marker for inventory management commands.

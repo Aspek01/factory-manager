@@ -1,62 +1,50 @@
-# Factory Manager — Dev Bootstrap (Windows PowerShell)
-# Deterministic local bring-up: repo root -> venv -> deps -> docker db -> django checks -> migrate -> canary -> rebuild
-
 $ErrorActionPreference = "Stop"
 
-# 0) Repo root'a git
-$repoRoot = (Get-ChildItem -Path $PWD -Recurse -Filter manage.py -File | Select-Object -First 1).DirectoryName
-if (-not $repoRoot) { throw "BLOCKER: manage.py bulunamadı" }
+function Invoke-Checked {
+    param(
+        [Parameter(Mandatory=$true)][string]$Label,
+        [Parameter(Mandatory=$true)][scriptblock]$Cmd
+    )
+    & $Cmd
+    if ($LASTEXITCODE -ne 0) {
+        throw "BLOCKER: $Label failed (exit=$LASTEXITCODE)"
+    }
+}
+
+# Repo root: bu script'in bulunduğu klasörün bir üstü
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location $repoRoot
-Write-Host "Repo root: $repoRoot"
+Write-Host "Repo root:" $repoRoot
 
-# 1) venv
-if (-not (Test-Path ".\.venv")) {
-  Write-Host ".venv yok -> oluşturuluyor"
-  py -m venv .venv
-}
-.\.venv\Scripts\Activate.ps1 | Out-Null
-
-# 2) pip + deps
-python -m pip install -U pip | Out-Null
-python -m pip install -r requirements.txt | Out-Null
-
-# 3) Docker Desktop + compose
-$dockerInfo = docker info 2>$null
-if (-not $dockerInfo) {
-  Write-Host "Docker çalışmıyor -> Docker Desktop başlatılıyor"
-  Start-Process "Docker Desktop"
-  Write-Host "Docker açılınca ENTER"
-  pause
-}
-
-if (Test-Path ".\docker-compose.yml") {
-  docker compose up -d
-} elseif (Test-Path ".\compose.yml") {
-  docker compose -f .\compose.yml up -d
-} else {
-  throw "BLOCKER: docker-compose.yml / compose.yml yok."
-}
-
-# 4) Postgres container adı (image=postgres:)
-$pgName = docker ps --format "{{.Image}} {{.Names}}" `
-  | Select-String -Pattern "^postgres:" `
-  | ForEach-Object { ($_ -split " ")[1] } `
-  | Select-Object -First 1
-
-if (-not $pgName) { throw "BLOCKER: postgres container bulunamadı (docker ps kontrol et)." }
-
-Write-Host "Postgres container: $pgName"
-docker exec $pgName pg_isready | Out-Host
-
-# 5) Django env
+# Django settings module (bu terminalde kalsın)
 $env:DJANGO_SETTINGS_MODULE = "factory_manager.settings"
 
-# 6) Django checks + migrate
-python manage.py check
-python manage.py migrate
+# Docker compose ayakta olsun
+if (Test-Path ".\docker-compose.yml") {
+    Invoke-Checked "docker compose up" { docker compose up -d }
+} elseif (Test-Path ".\compose.yml") {
+    Invoke-Checked "docker compose up (compose.yml)" { docker compose -f .\compose.yml up -d }
+} else {
+    throw "BLOCKER: docker-compose.yml / compose.yml yok."
+}
 
-# 7) Canary + rebuild
-python manage.py seed_stock_canary
-python manage.py rebuild_stock_summary
+# Postgres container adını deterministik bul (image üzerinden)
+$pgName = docker ps --format "{{.Image}} {{.Names}}" `
+| Select-String -Pattern "^postgres:" `
+| ForEach-Object { ($_ -split " ")[1] } `
+| Select-Object -First 1
+
+if (-not $pgName) { throw "BLOCKER: postgres container yok. docker ps çıktısını kontrol et." }
+Write-Host "Postgres container:" $pgName
+
+Invoke-Checked "pg_isready" { docker exec $pgName pg_isready }
+
+Invoke-Checked "django check" { python manage.py check }
+Invoke-Checked "django migrate" { python manage.py migrate }
+
+# Canary normalize (AVAILABLE-based; negative'e düşmez)
+Invoke-Checked "seed_stock_canary normalize" { python manage.py seed_stock_canary --normalize-to-target }
+
+Invoke-Checked "rebuild_stock_summary" { python manage.py rebuild_stock_summary }
 
 Write-Host "OK: dev bootstrap completed"
