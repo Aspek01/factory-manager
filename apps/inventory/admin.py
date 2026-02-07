@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any
 
 from django.contrib import admin, messages
+from django.core.exceptions import PermissionDenied
 from django.core.management import call_command
 from django.utils.html import format_html
 
@@ -42,8 +44,11 @@ def _is_system_admin_request(request) -> bool:
     if not membership:
         return False
 
-    # Be tolerant to different membership shapes.
-    role = getattr(membership, "role", None) or getattr(membership, "role_code", None) or getattr(membership, "role_name", None)
+    role = (
+        getattr(membership, "role", None)
+        or getattr(membership, "role_code", None)
+        or getattr(membership, "role_name", None)
+    )
     return role == "system_admin"
 
 
@@ -96,11 +101,44 @@ def _admin_scope_label(request) -> str:
     return "UNKNOWN"
 
 
-def _audit_admin_event(request, *, action: str, company_id, meta: dict[str, Any] | None = None) -> None:
+def _build_audit_context(request, company_id):
+    """
+    Build audit context compatible with apps.audit.hooks.emit_audit_event.
+    Minimal requirement: context.company_id
+    """
+    if not company_id:
+        return None
+
+    # Prefer canonical AuditContext if present.
+    try:
+        from apps.audit.context import AuditContext  # type: ignore
+
+        try:
+            return AuditContext(company_id=company_id)
+        except TypeError:
+            # Unknown ctor shape; fall back to SimpleNamespace.
+            return SimpleNamespace(company_id=company_id)
+    except Exception:
+        return SimpleNamespace(company_id=company_id)
+
+
+def _audit_admin_event(
+    request,
+    *,
+    action: str,
+    company_id,
+    meta: dict[str, Any] | None = None,
+) -> None:
     """
     Append-only audit event helper for admin actions/inspections.
-    Fail-fast: if audit fails, bubble up (no silent swallow).
+    IMPORTANT:
+    - audit_event(...) requires (event_name, payload, context, actor_id)
+    - If company_id cannot be resolved, we skip emit to avoid DB NOT NULL breaks.
     """
+    ctx = _build_audit_context(request, company_id)
+    if ctx is None:
+        return
+
     meta = meta or {}
     meta.update(
         {
@@ -113,11 +151,58 @@ def _audit_admin_event(request, *, action: str, company_id, meta: dict[str, Any]
         }
     )
 
+    actor_id = getattr(request.user, "id", None) if getattr(request, "user", None) else None
+
+    # Fail-fast: if audit is misconfigured, bubble up.
     audit_event(
-        company_id=company_id,
-        event_type="inventory.admin",
+        event_name="inventory.admin",
         payload=meta,
+        context=ctx,
+        actor_id=actor_id,
     )
+
+
+def _ensure_obj_in_tenant_or_raise(request, obj, *, company_field: str = "company_id") -> None:
+    """
+    Fail-fast object-level guard for admin detail pages.
+    - SYSTEM: always allowed.
+    - Non-system: object.company_id must match request company_id.
+    - Unknown request company: deny.
+    """
+    if obj is None:
+        return
+
+    if _is_system_admin_request(request):
+        return
+
+    req_company_id = _company_id_for_request(request)
+    if not req_company_id:
+        raise PermissionDenied("Tenant scope unresolved (fail-closed).")
+
+    obj_company_id = getattr(obj, company_field, None)
+    if obj_company_id != req_company_id:
+        raise PermissionDenied("Cross-company admin access is forbidden.")
+
+
+def _safe_admin_change_url_for_obj(request, *, model: str, obj_id, obj_company_id) -> str | None:
+    """
+    Prevent cross-tenant admin link leakage.
+    Returns None if link must not be rendered for this request.
+    """
+    if not obj_id:
+        return None
+
+    if _is_system_admin_request(request):
+        return f"/admin/inventory/{model}/{obj_id}/change/"
+
+    req_company_id = _company_id_for_request(request)
+    if not req_company_id:
+        return None
+
+    if obj_company_id != req_company_id:
+        return None
+
+    return f"/admin/inventory/{model}/{obj_id}/change/"
 
 
 @admin.register(Part)
@@ -126,20 +211,130 @@ class PartAdmin(admin.ModelAdmin):
     list_filter = ("part_type", "procurement_strategy")
     search_fields = ("part_no", "name")
     readonly_fields = ("last_purchase_price", "created_at", "updated_at")
+    ordering = ("part_no",)
+
+    def get_queryset(self, request):
+        return _tenant_filter_queryset(request, super().get_queryset(request))
+
+    def get_object(self, request, object_id, from_field=None):
+        obj = super().get_object(request, object_id, from_field=from_field)
+        _ensure_obj_in_tenant_or_raise(request, obj, company_field="company_id")
+        return obj
 
 
 @admin.register(BOM)
 class BOMAdmin(admin.ModelAdmin):
-    list_display = ("parent_part", "revision_index", "is_active", "company_id", "created_at")
-    list_filter = ("is_active",)
+    list_display = ("parent_part_link", "revision_index", "is_active", "company_id", "created_at")
+    list_filter = ("is_active", "company_id")
     search_fields = ("parent_part__part_no", "parent_part__name")
+    ordering = ("-created_at",)
+
+    def get_queryset(self, request):
+        qs = super().get_queryset(request).select_related("parent_part")
+        return _tenant_filter_queryset(request, qs)
+
+    def get_object(self, request, object_id, from_field=None):
+        obj = super().get_object(request, object_id, from_field=from_field)
+        _ensure_obj_in_tenant_or_raise(request, obj, company_field="company_id")
+        return obj
+
+    def parent_part_link(self, obj: BOM) -> str:
+        if not obj.parent_part_id:
+            return "-"
+
+        request = getattr(self, "_request", None)
+        label = getattr(obj.parent_part, "part_no", str(obj.parent_part_id))
+        if request is None:
+            return label
+
+        url = _safe_admin_change_url_for_obj(
+            request,
+            model="part",
+            obj_id=obj.parent_part_id,
+            obj_company_id=getattr(obj.parent_part, "company_id", None),
+        )
+        if not url:
+            return label
+        return format_html('<a href="{}">{}</a>', url, label)
+
+    parent_part_link.short_description = "parent_part"
+
+    def changelist_view(self, request, extra_context=None):
+        self._request = request
+        return super().changelist_view(request, extra_context=extra_context)
+
+    def change_view(self, request, object_id, form_url="", extra_context=None):
+        self._request = request
+        return super().change_view(request, object_id, form_url=form_url, extra_context=extra_context)
 
 
 @admin.register(BOMItem)
 class BOMItemAdmin(admin.ModelAdmin):
-    list_display = ("bom", "component_part", "qty_per", "is_direct", "company_id", "created_at")
-    list_filter = ("is_direct",)
+    list_display = ("bom_link", "component_part_link", "qty_per", "is_direct", "company_id", "created_at")
+    list_filter = ("is_direct", "company_id")
     search_fields = ("bom__parent_part__part_no", "component_part__part_no")
+    ordering = ("-created_at",)
+
+    def get_queryset(self, request):
+        qs = super().get_queryset(request).select_related("bom", "component_part", "bom__parent_part")
+        return _tenant_filter_queryset(request, qs)
+
+    def get_object(self, request, object_id, from_field=None):
+        obj = super().get_object(request, object_id, from_field=from_field)
+        _ensure_obj_in_tenant_or_raise(request, obj, company_field="company_id")
+        return obj
+
+    def bom_link(self, obj: BOMItem) -> str:
+        if not obj.bom_id:
+            return "-"
+
+        request = getattr(self, "_request", None)
+        label = f"BOM:{getattr(getattr(obj.bom, 'parent_part', None), 'part_no', '')} rev:{getattr(obj.bom, 'revision_index', '')}".strip()
+        label = label if label != "BOM: rev:" else str(obj.bom_id)
+
+        if request is None:
+            return label
+
+        url = _safe_admin_change_url_for_obj(
+            request,
+            model="bom",
+            obj_id=obj.bom_id,
+            obj_company_id=getattr(obj.bom, "company_id", None),
+        )
+        if not url:
+            return label
+        return format_html('<a href="{}">{}</a>', url, label)
+
+    bom_link.short_description = "bom"
+
+    def component_part_link(self, obj: BOMItem) -> str:
+        if not obj.component_part_id:
+            return "-"
+
+        request = getattr(self, "_request", None)
+        label = getattr(obj.component_part, "part_no", str(obj.component_part_id))
+        if request is None:
+            return label
+
+        url = _safe_admin_change_url_for_obj(
+            request,
+            model="part",
+            obj_id=obj.component_part_id,
+            obj_company_id=getattr(obj.component_part, "company_id", None),
+        )
+        if not url:
+            return label
+        return format_html('<a href="{}">{}</a>', url, label)
+
+    component_part_link.short_description = "component_part"
+
+    def changelist_view(self, request, extra_context=None):
+        self._request = request
+        return super().changelist_view(request, extra_context=extra_context)
+
+    def change_view(self, request, object_id, form_url="", extra_context=None):
+        self._request = request
+        return super().change_view(request, object_id, form_url=form_url, extra_context=extra_context)
 
 
 @admin.register(StockLedgerEntry)
@@ -149,7 +344,9 @@ class StockLedgerEntryAdmin(admin.ModelAdmin):
     - No create/update/delete.
     - Tenant-safe queryset (SYSTEM sees all; others see own company only).
     - Safe presentation for source_ref.
-    - Audited inspector access (list + detail).
+    - Audited inspector access (list + detail) when company_id is resolvable.
+    - Object-level guard on detail view.
+    - No cross-tenant Part link leakage.
     """
 
     list_display = (
@@ -169,12 +366,11 @@ class StockLedgerEntryAdmin(admin.ModelAdmin):
     date_hierarchy = "created_at"
     ordering = ("-created_at",)
 
-    # Hard read-only: no writes
     actions = None
 
     def changelist_view(self, request, extra_context=None):
+        self._request = request
         company_id = _company_id_for_request(request)
-        # SYSTEM visibility: company_id may be None; still log with None-safe payload
         _audit_admin_event(
             request,
             action="ledger.inspect.list",
@@ -184,6 +380,7 @@ class StockLedgerEntryAdmin(admin.ModelAdmin):
         return super().changelist_view(request, extra_context=extra_context)
 
     def change_view(self, request, object_id, form_url="", extra_context=None):
+        self._request = request
         company_id = _company_id_for_request(request)
         _audit_admin_event(
             request,
@@ -197,11 +394,15 @@ class StockLedgerEntryAdmin(admin.ModelAdmin):
         qs = super().get_queryset(request).select_related("part")
         return _tenant_filter_queryset(request, qs)
 
+    def get_object(self, request, object_id, from_field=None):
+        obj = super().get_object(request, object_id, from_field=from_field)
+        _ensure_obj_in_tenant_or_raise(request, obj, company_field="company_id")
+        return obj
+
     def has_add_permission(self, request):
         return False
 
     def has_change_permission(self, request, obj=None):
-        # Allow viewing object detail, forbid saving changes.
         if request.method in {"GET", "HEAD", "OPTIONS"}:
             return True
         return False
@@ -249,13 +450,11 @@ class StockLedgerEntryAdmin(admin.ModelAdmin):
     source_ref_pretty.short_description = "source_ref (pretty)"
 
     def source_ref_preview(self, obj: StockLedgerEntry) -> str:
-        # Short, safe preview for list view
         try:
             payload = obj.source_ref or {}
             s = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         except Exception:
             s = str(obj.source_ref)
-
         return (s[:77] + "...") if len(s) > 80 else s
 
     source_ref_preview.short_description = "source_ref"
@@ -263,21 +462,32 @@ class StockLedgerEntryAdmin(admin.ModelAdmin):
     def part_link(self, obj: StockLedgerEntry) -> str:
         if not obj.part_id:
             return "-"
-        url = f"/admin/inventory/part/{obj.part_id}/change/"
+
+        request = getattr(self, "_request", None)
         label = getattr(obj.part, "part_no", str(obj.part_id))
+        if request is None:
+            return label
+
+        url = _safe_admin_change_url_for_obj(
+            request,
+            model="part",
+            obj_id=obj.part_id,
+            obj_company_id=getattr(obj.part, "company_id", None),
+        )
+        if not url:
+            return label
         return format_html('<a href="{}">{}</a>', url, label)
 
     part_link.short_description = "part"
 
     def save_model(self, request, obj, form, change):
-        # Explicitly forbid any attempt to save via admin.
-        raise PermissionError("StockLedgerEntry is immutable (admin write forbidden)")
+        raise PermissionDenied("StockLedgerEntry is immutable (admin write forbidden)")
 
     def delete_model(self, request, obj):
-        raise PermissionError("StockLedgerEntry delete is forbidden (admin write forbidden)")
+        raise PermissionDenied("StockLedgerEntry delete is forbidden (admin write forbidden)")
 
     def delete_queryset(self, request, queryset):
-        raise PermissionError("StockLedgerEntry delete is forbidden (admin write forbidden)")
+        raise PermissionDenied("StockLedgerEntry delete is forbidden (admin write forbidden)")
 
 
 @admin.register(PartStockSummary)
@@ -287,7 +497,9 @@ class PartStockSummaryAdmin(admin.ModelAdmin):
     - Read-only (no manual edits).
     - Tenant-safe list.
     - Guarded rebuild uses management command (read-model only).
-    - Audit log for rebuild action.
+    - Audit log for rebuild action when company_id is resolvable.
+    - Object-level guard on detail view.
+    - No cross-tenant Part link leakage.
     """
 
     list_display = (
@@ -310,12 +522,26 @@ class PartStockSummaryAdmin(admin.ModelAdmin):
         qs = super().get_queryset(request).select_related("part")
         return _tenant_filter_queryset(request, qs)
 
-    # Hard read-only: no writes (summary is derived)
+    def get_object(self, request, object_id, from_field=None):
+        obj = super().get_object(request, object_id, from_field=from_field)
+
+        # IMPORTANT:
+        # If queryset is fail-closed (qs.none()) due to unresolved tenant scope,
+        # Django admin may treat obj=None as "doesn't exist" and redirect (302).
+        # We want fail-fast 403 in this case.
+        if obj is None:
+            if not _is_system_admin_request(request) and not _company_id_for_request(request):
+                raise PermissionDenied("Tenant scope unresolved (fail-closed).")
+            return None
+
+        _ensure_obj_in_tenant_or_raise(request, obj, company_field="company_id")
+        return obj
+
+
     def has_add_permission(self, request):
         return False
 
     def has_change_permission(self, request, obj=None):
-        # Allow viewing object detail, forbid saving changes.
         if request.method in {"GET", "HEAD", "OPTIONS"}:
             return True
         return False
@@ -338,31 +564,43 @@ class PartStockSummaryAdmin(admin.ModelAdmin):
     def part_link(self, obj: PartStockSummary) -> str:
         if not obj.part_id:
             return "-"
-        url = f"/admin/inventory/part/{obj.part_id}/change/"
+
+        request = getattr(self, "_request", None)
         label = getattr(obj.part, "part_no", str(obj.part_id))
+        if request is None:
+            return label
+
+        url = _safe_admin_change_url_for_obj(
+            request,
+            model="part",
+            obj_id=obj.part_id,
+            obj_company_id=getattr(obj.part, "company_id", None),
+        )
+        if not url:
+            return label
         return format_html('<a href="{}">{}</a>', url, label)
 
     part_link.short_description = "part"
 
+    def changelist_view(self, request, extra_context=None):
+        self._request = request
+        return super().changelist_view(request, extra_context=extra_context)
+
+    def change_view(self, request, object_id, form_url="", extra_context=None):
+        self._request = request
+        return super().change_view(request, object_id, form_url=form_url, extra_context=extra_context)
+
     @admin.action(description="Rebuild stock summary (selected parts)")
     def action_rebuild_selected_summaries(self, request, queryset):
-        """
-        Guarded action:
-        - Only affects PartStockSummary (read-model).
-        - Must be tenant-safe: non-system users can only rebuild within own company.
-        - Writes audit event (append-only).
-        """
         if not queryset.exists():
             self.message_user(request, "No rows selected.", level=messages.WARNING)
             return
 
-        # Tenant safety: filter to allowed scope again (fail-closed)
         safe_qs = _tenant_filter_queryset(request, queryset)
         if not safe_qs.exists():
             self.message_user(request, "No rows in your allowed scope.", level=messages.ERROR)
             return
 
-        # Ensure single-company selection for non-system users
         company_ids = list(safe_qs.values_list("company_id", flat=True).distinct())
         if not _is_system_admin_request(request) and len(company_ids) != 1:
             self.message_user(request, "Selection must belong to exactly one company.", level=messages.ERROR)
@@ -382,8 +620,6 @@ class PartStockSummaryAdmin(admin.ModelAdmin):
             meta={"model": "PartStockSummary", "parts": [str(pid) for pid in part_ids]},
         )
 
-        # Call management command in-process (admin action).
-        # The command must remain read-model only (no ledger writes).
         try:
             call_command("rebuild_stock_summary", "--part-ids", ",".join(str(pid) for pid in part_ids))
         except Exception as exc:
