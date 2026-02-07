@@ -5,7 +5,7 @@ from decimal import Decimal
 from uuid import uuid4
 
 from django.core.exceptions import PermissionDenied, ValidationError
-from django.db import models
+from django.db import IntegrityError, models, transaction
 
 from apps.inventory.guards import assert_max_depth, assert_no_circular_bom
 
@@ -208,6 +208,8 @@ class StockLedgerEntry(models.Model):
         Idempotency guard (append-only).
         Logical identity (MVP):
         company_id + part + movement_type + source_type + qty + unit_cost + reference_price + source_ref
+
+        DB-level unique index (D-3.11) enforces this under concurrency.
         """
         if not self._state.adding:
             return None
@@ -246,7 +248,7 @@ class StockLedgerEntry(models.Model):
 
         self.transaction_value = (Decimal(self.qty) * Decimal(self.unit_cost))
 
-        # Idempotency guard: prevent duplicate logical inserts (NO-OP)
+        # App-level idempotency guard (fast-path)
         dup = self._find_idempotent_duplicate()
         if dup:
             self.id = dup.id
@@ -255,7 +257,19 @@ class StockLedgerEntry(models.Model):
             return None
 
         is_new = self._state.adding
-        result = super().save(*args, **kwargs)
+
+        # DB-level safety guard (race condition): unique index may raise IntegrityError
+        try:
+            with transaction.atomic():
+                result = super().save(*args, **kwargs)
+        except IntegrityError:
+            dup2 = self._find_idempotent_duplicate()
+            if dup2:
+                self.id = dup2.id
+                self.created_at = dup2.created_at
+                self._state.adding = False
+                return None
+            raise
 
         # IMPORTANT: local import to avoid circular import at startup
         if is_new:
