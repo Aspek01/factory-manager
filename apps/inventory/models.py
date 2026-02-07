@@ -203,6 +203,30 @@ class StockLedgerEntry(models.Model):
             models.Index(fields=["company_id", "source_type", "created_at"]),
         ]
 
+    def _find_idempotent_duplicate(self) -> "StockLedgerEntry | None":
+        """
+        Idempotency guard (append-only).
+        Logical identity (MVP):
+        company_id + part + movement_type + source_type + qty + unit_cost + reference_price + source_ref
+        """
+        if not self._state.adding:
+            return None
+
+        return (
+            StockLedgerEntry.objects.filter(
+                company_id=self.company_id,
+                part_id=self.part_id,
+                movement_type=self.movement_type,
+                source_type=self.source_type,
+                qty=self.qty,
+                unit_cost=self.unit_cost,
+                reference_price=self.reference_price,
+                source_ref=self.source_ref,
+            )
+            .only("id", "created_at")
+            .first()
+        )
+
     def save(self, *args, **kwargs):
         # Append-only: update forbidden
         if self.pk and not self._state.adding:
@@ -222,12 +246,21 @@ class StockLedgerEntry(models.Model):
 
         self.transaction_value = (Decimal(self.qty) * Decimal(self.unit_cost))
 
+        # Idempotency guard: prevent duplicate logical inserts (NO-OP)
+        dup = self._find_idempotent_duplicate()
+        if dup:
+            self.id = dup.id
+            self.created_at = dup.created_at
+            self._state.adding = False
+            return None
+
         is_new = self._state.adding
         result = super().save(*args, **kwargs)
 
         # IMPORTANT: local import to avoid circular import at startup
         if is_new:
             from apps.inventory.hooks import on_ledger_insert
+
             on_ledger_insert(entry=self)
 
         return result
