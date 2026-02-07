@@ -8,7 +8,7 @@ from django.contrib.auth.models import Permission
 from django.test import TestCase
 from django.urls import reverse
 
-from apps.inventory.models import Part, PartStockSummary, StockLedgerEntry
+from apps.inventory.models import BOM, BOMItem, Part, PartStockSummary, StockLedgerEntry
 
 
 class AdminTenantIsolationTests(TestCase):
@@ -44,24 +44,52 @@ class AdminTenantIsolationTests(TestCase):
         cls.company_a = UUID("11111111-1111-1111-1111-111111111111")
         cls.company_b = UUID("22222222-2222-2222-2222-222222222222")
 
+        # IMPORTANT:
+        # BOM parent must be finished_good or semi_finished (model validation).
         cls.part_a = Part.objects.create(
             company_id=cls.company_a,
             part_no="A-001",
             name="Part A",
-            part_type=Part.PartType.RAW_MATERIAL,
-            procurement_strategy=Part.ProcurementStrategy.BUY,
+            part_type=Part.PartType.FINISHED_GOOD,
+            procurement_strategy=Part.ProcurementStrategy.MAKE,
         )
         cls.part_b = Part.objects.create(
             company_id=cls.company_b,
             part_no="B-001",
             name="Part B",
+            part_type=Part.PartType.FINISHED_GOOD,
+            procurement_strategy=Part.ProcurementStrategy.MAKE,
+        )
+
+        # Component raw material for BOMItem (company_a)
+        cls.rm_a = Part.objects.create(
+            company_id=cls.company_a,
+            part_no="RM-A-001",
+            name="Raw Material A",
             part_type=Part.PartType.RAW_MATERIAL,
             procurement_strategy=Part.ProcurementStrategy.BUY,
         )
 
+        # BOM fixtures (company_a)
+        cls.bom_a = BOM.objects.create(
+            company_id=cls.company_a,
+            parent_part=cls.part_a,
+            revision_index=1,
+            is_active=True,
+        )
+
+        cls.bom_item_a = BOMItem.objects.create(
+            company_id=cls.company_a,
+            bom=cls.bom_a,
+            component_part=cls.rm_a,
+            qty_per=Decimal("1.000000"),
+            is_direct=True,
+        )
+
+        # Ledger fixtures
         cls.ledger_a = StockLedgerEntry.objects.create(
             company_id=cls.company_a,
-            part=cls.part_a,
+            part=cls.rm_a,
             movement_type=StockLedgerEntry.MovementType.IN,
             source_type=StockLedgerEntry.SourceType.PURCHASE,
             qty=Decimal("10.000000"),
@@ -82,8 +110,9 @@ class AdminTenantIsolationTests(TestCase):
             source_ref={"doc": "GR-2"},
         )
 
+        # Summary fixtures (unique per part)
         cls.summary_a, _ = PartStockSummary.objects.get_or_create(
-            part=cls.part_a,
+            part=cls.rm_a,
             defaults={
                 "company_id": cls.company_a,
                 "available_qty": Decimal("10.000000"),
@@ -139,7 +168,7 @@ class AdminTenantIsolationTests(TestCase):
         Django admin may:
         - return 403 (PermissionDenied), OR
         - return 404 (not found), OR
-        - redirect (302) to changelist with a message when object isn't in queryset.
+        - redirect (302) to changelist/app index with a message when object isn't in queryset.
 
         IMPORTANT: 302 must NOT be a redirect to /admin/login/.
         """
@@ -150,16 +179,29 @@ class AdminTenantIsolationTests(TestCase):
 
         if r.status_code == 302:
             loc = r.headers.get("Location", "") or ""
-
-            # must not be auth redirect
             self.assertNotIn("/admin/login/", loc)
-
-            # admin may redirect either to app index (/admin/) or model changelist
-            self.assertTrue(
-                loc.startswith("/admin/"),
-                f"Unexpected redirect location: {loc}",
-            )
+            self.assertTrue(loc.startswith("/admin/"), f"Unexpected redirect location: {loc}")
             return
 
-
         self.assertIn(r.status_code, (403, 404))
+
+    def test_non_system_part_detail_is_403_when_tenant_unresolved(self):
+        self.client.force_login(self.staff)
+
+        url = "/admin/inventory/part/{}/change/".format(self.part_a.id)
+        r = self.client.get(url)
+        self.assertEqual(r.status_code, 403)
+
+    def test_non_system_bom_detail_is_403_when_tenant_unresolved(self):
+        self.client.force_login(self.staff)
+
+        url = "/admin/inventory/bom/{}/change/".format(self.bom_a.id)
+        r = self.client.get(url)
+        self.assertEqual(r.status_code, 403)
+
+    def test_non_system_bomitem_detail_is_403_when_tenant_unresolved(self):
+        self.client.force_login(self.staff)
+
+        url = "/admin/inventory/bomitem/{}/change/".format(self.bom_item_a.id)
+        r = self.client.get(url)
+        self.assertEqual(r.status_code, 403)
