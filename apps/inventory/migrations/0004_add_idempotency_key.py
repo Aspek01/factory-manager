@@ -4,6 +4,9 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
+    # REQUIRED: CREATE INDEX CONCURRENTLY cannot run inside a transaction block
+    atomic = False
+
     dependencies = [
         ("inventory", "0003_dedupe_ledger_then_unique_index"),
     ]
@@ -33,6 +36,5 @@ class Migration(migrations.Migration):
             reverse_sql="""
                 DROP INDEX CONCURRENTLY IF EXISTS ux_inventory_stock_ledger_idempotency_v2;
             """,
-            state_operations=[],
         ),
     ]
