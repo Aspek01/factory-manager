@@ -75,7 +75,8 @@ def _tenant_filter_queryset(request, qs):
     """
     SYSTEM => all
     non-system => own company only
-    fail-closed => none
+    fail-closed => none (query-level safe default)
+    NOTE: D-3.22 enforces LIST=403 via changelist_view, not via queryset.
     """
     if _is_system_admin_request(request):
         return qs
@@ -105,13 +106,15 @@ def _admin_scope_label(request) -> str:
 
 
 # =========================
-# Fail-closed policy (D-3.21)
+# Fail-closed policy (D-3.21 + D-3.22)
 # =========================
 def _deny_if_tenant_unresolved(request) -> None:
     """
     Deterministic fail-closed behavior across admin:
     - SYSTEM: allowed
     - non-system: if company_id cannot be resolved => 403
+
+    D-3.22: LIST (changelist) MUST be 403 when unresolved.
     """
     if _is_system_admin_request(request):
         return
@@ -232,6 +235,11 @@ class PartAdmin(admin.ModelAdmin):
     readonly_fields = ("last_purchase_price", "created_at", "updated_at")
     ordering = ("part_no",)
 
+    def changelist_view(self, request, extra_context=None):
+        # D-3.22: LIST must be 403 when tenant unresolved (non-system)
+        _deny_if_tenant_unresolved(request)
+        return super().changelist_view(request, extra_context=extra_context)
+
     def get_queryset(self, request):
         return _tenant_filter_queryset(request, super().get_queryset(request))
 
@@ -252,6 +260,12 @@ class BOMAdmin(admin.ModelAdmin):
     list_filter = ("is_active", "company_id")
     search_fields = ("parent_part__part_no", "parent_part__name")
     ordering = ("-created_at",)
+
+    def changelist_view(self, request, extra_context=None):
+        # D-3.22: LIST must be 403 when tenant unresolved (non-system)
+        _deny_if_tenant_unresolved(request)
+        self._request = request
+        return super().changelist_view(request, extra_context=extra_context)
 
     def get_queryset(self, request):
         qs = super().get_queryset(request).select_related("parent_part")
@@ -284,10 +298,6 @@ class BOMAdmin(admin.ModelAdmin):
 
     parent_part_link.short_description = "parent_part"
 
-    def changelist_view(self, request, extra_context=None):
-        self._request = request
-        return super().changelist_view(request, extra_context=extra_context)
-
     def change_view(self, request, object_id, form_url="", extra_context=None):
         self._request = request
         _deny_if_tenant_unresolved(request)
@@ -300,6 +310,12 @@ class BOMItemAdmin(admin.ModelAdmin):
     list_filter = ("is_direct", "company_id")
     search_fields = ("bom__parent_part__part_no", "component_part__part_no")
     ordering = ("-created_at",)
+
+    def changelist_view(self, request, extra_context=None):
+        # D-3.22: LIST must be 403 when tenant unresolved (non-system)
+        _deny_if_tenant_unresolved(request)
+        self._request = request
+        return super().changelist_view(request, extra_context=extra_context)
 
     def get_queryset(self, request):
         qs = super().get_queryset(request).select_related("bom", "component_part", "bom__parent_part")
@@ -358,10 +374,6 @@ class BOMItemAdmin(admin.ModelAdmin):
 
     component_part_link.short_description = "component_part"
 
-    def changelist_view(self, request, extra_context=None):
-        self._request = request
-        return super().changelist_view(request, extra_context=extra_context)
-
     def change_view(self, request, object_id, form_url="", extra_context=None):
         self._request = request
         _deny_if_tenant_unresolved(request)
@@ -400,6 +412,9 @@ class StockLedgerEntryAdmin(admin.ModelAdmin):
     actions = None
 
     def changelist_view(self, request, extra_context=None):
+        # D-3.22: LIST must be 403 when tenant unresolved (non-system)
+        _deny_if_tenant_unresolved(request)
+
         self._request = request
         company_id = _company_id_for_request(request)
         _audit_admin_event(
@@ -551,6 +566,12 @@ class PartStockSummaryAdmin(admin.ModelAdmin):
 
     actions = ["action_rebuild_selected_summaries"]
 
+    def changelist_view(self, request, extra_context=None):
+        # D-3.22: LIST must be 403 when tenant unresolved (non-system)
+        _deny_if_tenant_unresolved(request)
+        self._request = request
+        return super().changelist_view(request, extra_context=extra_context)
+
     def get_queryset(self, request):
         qs = super().get_queryset(request).select_related("part")
         return _tenant_filter_queryset(request, qs)
@@ -609,10 +630,6 @@ class PartStockSummaryAdmin(admin.ModelAdmin):
         return format_html('<a href="{}">{}</a>', url, label)
 
     part_link.short_description = "part"
-
-    def changelist_view(self, request, extra_context=None):
-        self._request = request
-        return super().changelist_view(request, extra_context=extra_context)
 
     @admin.action(description="Rebuild stock summary (selected parts)")
     def action_rebuild_selected_summaries(self, request, queryset):

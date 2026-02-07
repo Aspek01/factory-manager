@@ -148,18 +148,20 @@ class AdminTenantIsolationTests(TestCase):
         cl = resp.context["cl"]
         self.assertEqual(cl.result_count, 2)
 
-    def test_non_system_without_tenant_scope_sees_nothing_fail_closed(self):
+    def test_non_system_without_tenant_scope_list_is_403_fail_closed(self):
+        """
+        D-3.22:
+        Non-system + tenant unresolved => LIST must be 403 (not empty list).
+        """
         self.client.force_login(self.staff)
 
         url1 = reverse("admin:inventory_stockledgerentry_changelist")
         r1 = self.client.get(url1)
-        self.assertEqual(r1.status_code, 200)
-        self.assertEqual(r1.context["cl"].result_count, 0)
+        self.assertEqual(r1.status_code, 403)
 
         url2 = reverse("admin:inventory_partstocksummary_changelist")
         r2 = self.client.get(url2)
-        self.assertEqual(r2.status_code, 200)
-        self.assertEqual(r2.context["cl"].result_count, 0)
+        self.assertEqual(r2.status_code, 403)
 
     def test_non_system_detail_view_denied_or_not_found_out_of_scope(self):
         """
