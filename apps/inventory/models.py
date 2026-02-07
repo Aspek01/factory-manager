@@ -193,6 +193,15 @@ class StockLedgerEntry(models.Model):
     reference_price = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
     source_ref = models.JSONField(default=dict)
 
+    # v2 idempotency (API event standard) — optional
+    idempotency_key = models.CharField(max_length=128, null=True, blank=True)
+    idempotency_scope = models.CharField(
+        max_length=16,
+        null=True,
+        blank=True,
+        help_text="SYSTEM|COMPANY|FACILITY|SECTION|WORKSTATION (nullable).",
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -201,12 +210,32 @@ class StockLedgerEntry(models.Model):
             models.Index(fields=["company_id", "created_at"]),
             models.Index(fields=["company_id", "part", "created_at"]),
             models.Index(fields=["company_id", "source_type", "created_at"]),
+            models.Index(fields=["company_id", "idempotency_key"]),
         ]
 
-    def _find_idempotent_duplicate(self) -> "StockLedgerEntry | None":
+    def _find_idempotent_duplicate_v2(self) -> "StockLedgerEntry | None":
         """
-        Idempotency guard (append-only).
-        Logical identity (MVP):
+        V2 idempotency guard (preferred):
+        company_id + idempotency_scope + idempotency_key  (when key is present)
+        """
+        if not self._state.adding:
+            return None
+        if not self.idempotency_key:
+            return None
+
+        return (
+            StockLedgerEntry.objects.filter(
+                company_id=self.company_id,
+                idempotency_scope=self.idempotency_scope,
+                idempotency_key=self.idempotency_key,
+            )
+            .only("id", "created_at")
+            .first()
+        )
+
+    def _find_idempotent_duplicate_v1(self) -> "StockLedgerEntry | None":
+        """
+        V1 idempotency guard (append-only, logical-key fallback).
         company_id + part + movement_type + source_type + qty + unit_cost + reference_price + source_ref
 
         DB-level unique index (D-3.11) enforces this under concurrency.
@@ -229,6 +258,13 @@ class StockLedgerEntry(models.Model):
             .first()
         )
 
+    def clean(self):
+        super().clean()
+
+        # If idempotency_key is present, scope must also be present (fail-fast)
+        if self.idempotency_key and not self.idempotency_scope:
+            raise ValidationError("idempotency_scope is required when idempotency_key is provided")
+
     def save(self, *args, **kwargs):
         # Append-only: update forbidden
         if self.pk and not self._state.adding:
@@ -246,10 +282,11 @@ class StockLedgerEntry(models.Model):
         if self.qty is None:
             raise ValidationError("qty is required")
 
+        self.full_clean()
         self.transaction_value = (Decimal(self.qty) * Decimal(self.unit_cost))
 
-        # App-level idempotency guard (fast-path)
-        dup = self._find_idempotent_duplicate()
+        # App-level idempotency guard (fast-path): v2 first, then v1
+        dup = self._find_idempotent_duplicate_v2() or self._find_idempotent_duplicate_v1()
         if dup:
             self.id = dup.id
             self.created_at = dup.created_at
@@ -258,12 +295,12 @@ class StockLedgerEntry(models.Model):
 
         is_new = self._state.adding
 
-        # DB-level safety guard (race condition): unique index may raise IntegrityError
+        # DB-level safety guard (race condition): unique indexes may raise IntegrityError
         try:
             with transaction.atomic():
                 result = super().save(*args, **kwargs)
         except IntegrityError:
-            dup2 = self._find_idempotent_duplicate()
+            dup2 = self._find_idempotent_duplicate_v2() or self._find_idempotent_duplicate_v1()
             if dup2:
                 self.id = dup2.id
                 self.created_at = dup2.created_at
