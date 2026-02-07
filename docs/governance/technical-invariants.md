@@ -20,6 +20,26 @@
 - Aynı key + aynı scope + aynı payload → aynı sonuç; mükerrer kayıt yok.
 - Idempotency kayıtları append-only audit ile izlenebilir.
 
-## 5) UI Read-model Kuralı
+## 5) Ledger Idempotency (Domain Logical Key Standardı)
+- Ledger türü yazımlarda (append-only) **mükerrer insert** yasaktır.
+- Mükerrerlik, “aynı işin tekrar yazılması” anlamına gelir ve **logical key** ile tespit edilir.
+- Logical key karşılaştırması **deterministik** olmalıdır:
+  - Sayılar `Decimal` olarak normalize edilir (float kullanılmaz).
+  - JSON (`source_ref`) yapısal eşitlik ile kıyaslanır (jsonb); uygulama tarafında key’ler deterministik üretilir.
+- `StockLedgerEntry` için MVP logical key aşağıdaki alanlardan oluşur:
+  - `company_id`
+  - `part_id`
+  - `movement_type`
+  - `source_type`
+  - `qty`
+  - `unit_cost`
+  - `reference_price` (nullable)
+  - `source_ref` (json)
+- Bu logical key ile aynı kayıt zaten varsa:
+  - Yeni satır eklenmez (NO-OP).
+  - Hook/event tetiklenmez (insert yoksa yok).
+
+## 6) UI Read-model Kuralı
 - UI, ledger tablosundan doğrudan okumaz.
 - UI için read-model zorunludur (materialized/denormalized view tabloları).
+
