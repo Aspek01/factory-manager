@@ -14,6 +14,9 @@ from apps.audit.hooks import audit_event
 from .models import BOM, BOMItem, Part, PartStockSummary, StockLedgerEntry
 
 
+# =========================
+# Tenant resolution helpers
+# =========================
 def _resolve_membership_for_admin(request):
     """
     Admin requests should be tenant-safe.
@@ -101,73 +104,26 @@ def _admin_scope_label(request) -> str:
     return "UNKNOWN"
 
 
-def _build_audit_context(request, company_id):
+# =========================
+# Fail-closed policy (D-3.21)
+# =========================
+def _deny_if_tenant_unresolved(request) -> None:
     """
-    Build audit context compatible with apps.audit.hooks.emit_audit_event.
-    Minimal requirement: context.company_id
+    Deterministic fail-closed behavior across admin:
+    - SYSTEM: allowed
+    - non-system: if company_id cannot be resolved => 403
     """
-    if not company_id:
-        return None
-
-    # Prefer canonical AuditContext if present.
-    try:
-        from apps.audit.context import AuditContext  # type: ignore
-
-        try:
-            return AuditContext(company_id=company_id)
-        except TypeError:
-            # Unknown ctor shape; fall back to SimpleNamespace.
-            return SimpleNamespace(company_id=company_id)
-    except Exception:
-        return SimpleNamespace(company_id=company_id)
-
-
-def _audit_admin_event(
-    request,
-    *,
-    action: str,
-    company_id,
-    meta: dict[str, Any] | None = None,
-) -> None:
-    """
-    Append-only audit event helper for admin actions/inspections.
-    IMPORTANT:
-    - audit_event(...) requires (event_name, payload, context, actor_id)
-    - If company_id cannot be resolved, we skip emit to avoid DB NOT NULL breaks.
-    """
-    ctx = _build_audit_context(request, company_id)
-    if ctx is None:
+    if _is_system_admin_request(request):
         return
-
-    meta = meta or {}
-    meta.update(
-        {
-            "surface": "admin",
-            "action": action,
-            "scope": _admin_scope_label(request),
-            "user_id": str(getattr(request.user, "id", "")) if getattr(request, "user", None) else "",
-            "username": getattr(request.user, "username", "") if getattr(request, "user", None) else "",
-            "path": getattr(request, "path", ""),
-        }
-    )
-
-    actor_id = getattr(request.user, "id", None) if getattr(request, "user", None) else None
-
-    # Fail-fast: if audit is misconfigured, bubble up.
-    audit_event(
-        event_name="inventory.admin",
-        payload=meta,
-        context=ctx,
-        actor_id=actor_id,
-    )
+    if not _company_id_for_request(request):
+        raise PermissionDenied("Tenant scope unresolved (fail-closed).")
 
 
 def _ensure_obj_in_tenant_or_raise(request, obj, *, company_field: str = "company_id") -> None:
     """
-    Fail-fast object-level guard for admin detail pages.
+    Object-level guard for admin detail pages.
     - SYSTEM: always allowed.
-    - Non-system: object.company_id must match request company_id.
-    - Unknown request company: deny.
+    - Non-system: requires resolved company_id and object.company_id must match.
     """
     if obj is None:
         return
@@ -205,6 +161,69 @@ def _safe_admin_change_url_for_obj(request, *, model: str, obj_id, obj_company_i
     return f"/admin/inventory/{model}/{obj_id}/change/"
 
 
+# =========================
+# Audit helpers (compatible with audit_event signature)
+# =========================
+def _build_audit_context(company_id):
+    """
+    Build audit context compatible with apps.audit.hooks.emit_audit_event.
+    Minimal requirement: context.company_id
+    """
+    if not company_id:
+        return None
+
+    try:
+        from apps.audit.context import AuditContext  # type: ignore
+
+        try:
+            return AuditContext(company_id=company_id)
+        except TypeError:
+            return SimpleNamespace(company_id=company_id)
+    except Exception:
+        return SimpleNamespace(company_id=company_id)
+
+
+def _audit_admin_event(
+    request,
+    *,
+    action: str,
+    company_id,
+    meta: dict[str, Any] | None = None,
+) -> None:
+    """
+    Append-only audit event helper for admin actions/inspections.
+    IMPORTANT:
+    - audit_event(...) requires (event_name, payload, context, actor_id)
+    - If company_id cannot be resolved, skip emit to avoid DB NOT NULL breaks.
+    """
+    ctx = _build_audit_context(company_id)
+    if ctx is None:
+        return
+
+    meta = meta or {}
+    meta.update(
+        {
+            "surface": "admin",
+            "action": action,
+            "scope": _admin_scope_label(request),
+            "user_id": str(getattr(request.user, "id", "")) if getattr(request, "user", None) else "",
+            "username": getattr(request.user, "username", "") if getattr(request, "user", None) else "",
+            "path": getattr(request, "path", ""),
+        }
+    )
+
+    actor_id = getattr(request.user, "id", None) if getattr(request, "user", None) else None
+    audit_event(
+        event_name="inventory.admin",
+        payload=meta,
+        context=ctx,
+        actor_id=actor_id,
+    )
+
+
+# =========================
+# Admin registrations
+# =========================
 @admin.register(Part)
 class PartAdmin(admin.ModelAdmin):
     list_display = ("part_no", "name", "part_type", "procurement_strategy", "company_id", "updated_at")
@@ -217,9 +236,14 @@ class PartAdmin(admin.ModelAdmin):
         return _tenant_filter_queryset(request, super().get_queryset(request))
 
     def get_object(self, request, object_id, from_field=None):
+        _deny_if_tenant_unresolved(request)
         obj = super().get_object(request, object_id, from_field=from_field)
         _ensure_obj_in_tenant_or_raise(request, obj, company_field="company_id")
         return obj
+
+    def change_view(self, request, object_id, form_url="", extra_context=None):
+        _deny_if_tenant_unresolved(request)
+        return super().change_view(request, object_id, form_url=form_url, extra_context=extra_context)
 
 
 @admin.register(BOM)
@@ -234,6 +258,7 @@ class BOMAdmin(admin.ModelAdmin):
         return _tenant_filter_queryset(request, qs)
 
     def get_object(self, request, object_id, from_field=None):
+        _deny_if_tenant_unresolved(request)
         obj = super().get_object(request, object_id, from_field=from_field)
         _ensure_obj_in_tenant_or_raise(request, obj, company_field="company_id")
         return obj
@@ -265,6 +290,7 @@ class BOMAdmin(admin.ModelAdmin):
 
     def change_view(self, request, object_id, form_url="", extra_context=None):
         self._request = request
+        _deny_if_tenant_unresolved(request)
         return super().change_view(request, object_id, form_url=form_url, extra_context=extra_context)
 
 
@@ -280,6 +306,7 @@ class BOMItemAdmin(admin.ModelAdmin):
         return _tenant_filter_queryset(request, qs)
 
     def get_object(self, request, object_id, from_field=None):
+        _deny_if_tenant_unresolved(request)
         obj = super().get_object(request, object_id, from_field=from_field)
         _ensure_obj_in_tenant_or_raise(request, obj, company_field="company_id")
         return obj
@@ -289,7 +316,10 @@ class BOMItemAdmin(admin.ModelAdmin):
             return "-"
 
         request = getattr(self, "_request", None)
-        label = f"BOM:{getattr(getattr(obj.bom, 'parent_part', None), 'part_no', '')} rev:{getattr(obj.bom, 'revision_index', '')}".strip()
+        label = (
+            f"BOM:{getattr(getattr(obj.bom, 'parent_part', None), 'part_no', '')} "
+            f"rev:{getattr(obj.bom, 'revision_index', '')}"
+        ).strip()
         label = label if label != "BOM: rev:" else str(obj.bom_id)
 
         if request is None:
@@ -334,6 +364,7 @@ class BOMItemAdmin(admin.ModelAdmin):
 
     def change_view(self, request, object_id, form_url="", extra_context=None):
         self._request = request
+        _deny_if_tenant_unresolved(request)
         return super().change_view(request, object_id, form_url=form_url, extra_context=extra_context)
 
 
@@ -381,6 +412,7 @@ class StockLedgerEntryAdmin(admin.ModelAdmin):
 
     def change_view(self, request, object_id, form_url="", extra_context=None):
         self._request = request
+        _deny_if_tenant_unresolved(request)
         company_id = _company_id_for_request(request)
         _audit_admin_event(
             request,
@@ -395,6 +427,7 @@ class StockLedgerEntryAdmin(admin.ModelAdmin):
         return _tenant_filter_queryset(request, qs)
 
     def get_object(self, request, object_id, from_field=None):
+        _deny_if_tenant_unresolved(request)
         obj = super().get_object(request, object_id, from_field=from_field)
         _ensure_obj_in_tenant_or_raise(request, obj, company_field="company_id")
         return obj
@@ -523,20 +556,15 @@ class PartStockSummaryAdmin(admin.ModelAdmin):
         return _tenant_filter_queryset(request, qs)
 
     def get_object(self, request, object_id, from_field=None):
+        _deny_if_tenant_unresolved(request)
         obj = super().get_object(request, object_id, from_field=from_field)
-
-        # IMPORTANT:
-        # If queryset is fail-closed (qs.none()) due to unresolved tenant scope,
-        # Django admin may treat obj=None as "doesn't exist" and redirect (302).
-        # We want fail-fast 403 in this case.
-        if obj is None:
-            if not _is_system_admin_request(request) and not _company_id_for_request(request):
-                raise PermissionDenied("Tenant scope unresolved (fail-closed).")
-            return None
-
         _ensure_obj_in_tenant_or_raise(request, obj, company_field="company_id")
         return obj
 
+    def change_view(self, request, object_id, form_url="", extra_context=None):
+        self._request = request
+        _deny_if_tenant_unresolved(request)
+        return super().change_view(request, object_id, form_url=form_url, extra_context=extra_context)
 
     def has_add_permission(self, request):
         return False
@@ -585,10 +613,6 @@ class PartStockSummaryAdmin(admin.ModelAdmin):
     def changelist_view(self, request, extra_context=None):
         self._request = request
         return super().changelist_view(request, extra_context=extra_context)
-
-    def change_view(self, request, object_id, form_url="", extra_context=None):
-        self._request = request
-        return super().change_view(request, object_id, form_url=form_url, extra_context=extra_context)
 
     @admin.action(description="Rebuild stock summary (selected parts)")
     def action_rebuild_selected_summaries(self, request, queryset):
