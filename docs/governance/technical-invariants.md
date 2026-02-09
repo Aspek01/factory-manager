@@ -11,6 +11,28 @@
 - Düzeltme yalnızca reverse/adjustment entry ile yapılır.
 - "Soft delete" yasaktır.
 
+### 2.1) Reverse Entry Standardı (LOCKED)
+Amaç: Hatalı bir ledger satırının etkisini, **yeni bir append-only satır** ile sıfırlamak veya düzeltmek.
+
+**Kurallar**
+- Reverse, asla mevcut satırı değiştirmez; sadece yeni satır yazar.
+- Reverse satırı mutlaka “hangi satırı terslediğini” referanslamalıdır.
+- Reverse işleminde company boundary değişmez: `company_id` aynı olmalıdır.
+- Reverse satırı, orijinal satırın **qty etkisini** tersine çevirmelidir:
+  - Orijinal `movement_type=in` ise reverse satırı `movement_type=out` olur ve `qty` aynı büyüklükte olur.
+  - Orijinal `movement_type=out` ise reverse satırı `movement_type=in` olur ve `qty` aynı büyüklükte olur.
+  - Orijinal `movement_type=adjustment` ise reverse satırı `movement_type=adjustment` kalır ve `qty = -original.qty` olur.
+- Reverse satırı bir kez yazılır; aynı original satır için ikinci reverse **yasaktır** (idempotency/uniqueness ile engellenir).
+- Reverse satırı da ledger idempotency standardına tabidir.
+- Reverse satırı yazıldığında:
+  - Read-model’ler update edilir (normal ledger insert gibi).
+  - Audit event emit edilir.
+
+**Negatif stok ile etkileşim**
+- Negatif stok guard fail-closed kalır.
+- Reverse satırı, negatif stok guard’ı bypass etmez; projected balance yine 0’ın altına düşemez.
+  - Bu, sistemin hiçbir koşulda “imkânsız stok”a düşmemesini garanti eder.
+
 ## 3) Fail-fast
 - Guard ihlallerinde try/except ile yutma yoktur.
 - Guard ihlali = PermissionDenied/ValidationError ile işlem kesilir.
@@ -42,4 +64,3 @@
 ## 6) UI Read-model Kuralı
 - UI, ledger tablosundan doğrudan okumaz.
 - UI için read-model zorunludur (materialized/denormalized view tabloları).
-

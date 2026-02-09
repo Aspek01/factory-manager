@@ -195,6 +195,16 @@ class StockLedgerEntry(models.Model):
     reference_price = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
     source_ref = models.JSONField(default=dict)
 
+    # D-3.27 — Reverse schema (correction via reverse entry; still append-only)
+    reverse_of = models.OneToOneField(
+        "self",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="reversed_by",
+        help_text="If set, this row is the reverse/correction entry of the referenced original row.",
+    )
+
     # v2 idempotency (API event standard) — optional
     idempotency_key = models.CharField(max_length=128, null=True, blank=True)
     idempotency_scope = models.CharField(
@@ -323,6 +333,41 @@ class StockLedgerEntry(models.Model):
         if self.idempotency_key and not self.idempotency_scope:
             raise ValidationError("idempotency_scope is required when idempotency_key is provided")
 
+        # D-3.27 — Reverse semantics (fail-fast)
+        if self.reverse_of_id:
+            if self.reverse_of_id == self.id:
+                raise ValidationError("reverse_of cannot point to itself")
+
+            orig = self.reverse_of  # resolved by Django (FK cache)
+            if orig.company_id != self.company_id:
+                raise ValidationError("company_id mismatch between reverse entry and original entry")
+
+            # single-step: do not allow reversing a reverse entry
+            if getattr(orig, "reverse_of_id", None):
+                raise ValidationError("cannot reverse a reverse entry")
+
+            # reverse rows must be adjustment source (traceable correction lane)
+            if self.source_type != self.SourceType.ADJUSTMENT:
+                raise ValidationError("reverse entries must use source_type=adjustment")
+
+            # movement rule
+            if orig.movement_type == self.MovementType.IN:
+                if self.movement_type != self.MovementType.OUT:
+                    raise ValidationError("reverse of an IN must be an OUT")
+                if Decimal(self.qty) != Decimal(orig.qty):
+                    raise ValidationError("reverse qty must match original qty for IN/OUT")
+            elif orig.movement_type == self.MovementType.OUT:
+                if self.movement_type != self.MovementType.IN:
+                    raise ValidationError("reverse of an OUT must be an IN")
+                if Decimal(self.qty) != Decimal(orig.qty):
+                    raise ValidationError("reverse qty must match original qty for IN/OUT")
+            else:
+                # adjustment reversed by adjustment with -qty
+                if self.movement_type != self.MovementType.ADJUSTMENT:
+                    raise ValidationError("reverse of an ADJUSTMENT must be an ADJUSTMENT")
+                if Decimal(self.qty) != (Decimal(orig.qty) * Decimal("-1")):
+                    raise ValidationError("reverse qty must be -original.qty for ADJUSTMENT")
+
     def save(self, *args, **kwargs):
         if self.pk and not self._state.adding:
             raise PermissionDenied("StockLedgerEntry is immutable (append-only)")
@@ -359,7 +404,10 @@ class StockLedgerEntry(models.Model):
         try:
             with transaction.atomic():
                 delta = self._movement_delta_qty()
-                if delta < 0:
+
+                # D-3.25 — Negative stock guard:
+                # reverse/correction entries are an explicit exception lane (spec) -> do not block.
+                if delta < 0 and not self.reverse_of_id:
                     self._acquire_part_xact_lock()
                     current = self._current_available_qty_locked()
                     projected = current + delta
