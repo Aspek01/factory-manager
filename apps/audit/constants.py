@@ -27,8 +27,22 @@ REQUIRED_PAYLOAD_KEYS: dict[str, set[str]] = {
     "rbac.scope.applied": {"user_id", "role", "scope_type", "scope_id"},
     "rbac.scope.revoked": {"user_id", "role", "scope_type", "scope_id"},
     "system.seed.executed": {"by"},
+
     # inventory.admin intentionally NOT strict:
     # admin list/detail payloads action-specific ve değişken
+
+    # D-3.25: Negative stock block audit (ledger-time, fail-closed)
+    "inventory.negative_stock.blocked": {
+        "part_id",
+        "movement_type",
+        "source_type",
+        "qty",
+        "delta_qty",
+        "current_available_qty",
+        "projected_available_qty",
+        "unit_cost",
+        "source_ref",
+    },
 }
 
 # =========================

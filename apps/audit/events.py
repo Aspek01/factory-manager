@@ -45,6 +45,13 @@ EVENTS: Dict[str, AuditEventSpec] = {
         name="inventory.admin",
         notes="Admin surface access (list/detail) tenant-safe audit emission.",
     ),
+
+    # --- inventory / ledger guards ---
+    "inventory.negative_stock.blocked": AuditEventSpec(
+        name="inventory.negative_stock.blocked",
+        notes="Ledger-time negative stock attempt blocked (fail-closed).",
+    ),
+
 }
 
 

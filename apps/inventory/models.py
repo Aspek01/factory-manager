@@ -1,12 +1,14 @@
-# apps/inventory/models.py
 from __future__ import annotations
 
 from decimal import Decimal
 from uuid import uuid4
 
 from django.core.exceptions import PermissionDenied, ValidationError
-from django.db import IntegrityError, models, transaction
+from django.db import IntegrityError, connection, models, transaction
+from django.db.models import Case, DecimalField, Sum, Value, When
+from django.db.models.functions import Coalesce
 
+from apps.audit.hooks import emit_audit_event
 from apps.inventory.guards import assert_max_depth, assert_no_circular_bom
 
 
@@ -214,10 +216,6 @@ class StockLedgerEntry(models.Model):
         ]
 
     def _find_idempotent_duplicate_v2(self) -> "StockLedgerEntry | None":
-        """
-        V2 idempotency guard (preferred):
-        company_id + idempotency_scope + idempotency_key  (when key is present)
-        """
         if not self._state.adding:
             return None
         if not self.idempotency_key:
@@ -234,12 +232,6 @@ class StockLedgerEntry(models.Model):
         )
 
     def _find_idempotent_duplicate_v1(self) -> "StockLedgerEntry | None":
-        """
-        V1 idempotency guard (append-only, logical-key fallback).
-        company_id + part + movement_type + source_type + qty + unit_cost + reference_price + source_ref
-
-        DB-level unique index (D-3.11) enforces this under concurrency.
-        """
         if not self._state.adding:
             return None
 
@@ -258,34 +250,103 @@ class StockLedgerEntry(models.Model):
             .first()
         )
 
+    def _movement_delta_qty(self) -> Decimal:
+        q = Decimal(self.qty)
+        if self.movement_type == self.MovementType.IN:
+            return q
+        if self.movement_type == self.MovementType.OUT:
+            return -q
+        return q  # adjustment is signed
+
+    def _acquire_part_xact_lock(self) -> None:
+        if connection.vendor == "postgresql":
+            key = (int(self.company_id) ^ int(self.part_id)) & 0x7FFFFFFFFFFFFFFF
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_xact_lock(%s);", [key])
+            return
+
+        Part.objects.select_for_update().only("id").get(id=self.part_id)
+
+    def _current_available_qty_locked(self) -> Decimal:
+        signed = Case(
+            When(movement_type=self.MovementType.IN, then=models.F("qty")),
+            When(movement_type=self.MovementType.OUT, then=models.F("qty") * Value(Decimal("-1"))),
+            When(movement_type=self.MovementType.ADJUSTMENT, then=models.F("qty")),
+            default=Value(Decimal("0")),
+            output_field=DecimalField(max_digits=18, decimal_places=6),
+        )
+        agg = (
+            StockLedgerEntry.objects.filter(company_id=self.company_id, part_id=self.part_id)
+            .aggregate(total=Coalesce(Sum(signed), Value(Decimal("0"))))
+        )
+        return Decimal(agg["total"])
+
+    def _emit_negative_stock_block_audit(self, *, current: Decimal, delta: Decimal, projected: Decimal) -> None:
+        """
+        Emit audit OUTSIDE the ledger insert transaction (so it persists even when we block).
+        Best-effort: audit failure must not mask the original ValidationError.
+        """
+
+        class _Ctx:
+            def __init__(self, company_id):
+                self.company_id = company_id
+                self.is_system = False
+
+        ctx = _Ctx(self.company_id)
+
+        try:
+            emit_audit_event(
+                event_name="inventory.negative_stock.blocked",
+                payload={
+                    "part_id": str(self.part_id),
+                    "movement_type": str(self.movement_type),
+                    "source_type": str(self.source_type),
+                    "qty": str(self.qty),
+                    "delta_qty": str(delta),
+                    "current_available_qty": str(current),
+                    "projected_available_qty": str(projected),
+                    "unit_cost": str(self.unit_cost),
+                    "reference_price": str(self.reference_price) if self.reference_price is not None else None,
+                    "source_ref": self.source_ref or {},
+                    "idempotency_key": self.idempotency_key,
+                    "idempotency_scope": self.idempotency_scope,
+                },
+                context=ctx,
+                actor_id=None,
+            )
+        except Exception:
+            return
+
     def clean(self):
         super().clean()
 
-        # If idempotency_key is present, scope must also be present (fail-fast)
         if self.idempotency_key and not self.idempotency_scope:
             raise ValidationError("idempotency_scope is required when idempotency_key is provided")
 
     def save(self, *args, **kwargs):
-        # Append-only: update forbidden
         if self.pk and not self._state.adding:
             raise PermissionDenied("StockLedgerEntry is immutable (append-only)")
 
-        # Company boundary safety
         if self.part_id is None:
             raise ValidationError("part is required")
         if self.part.company_id != self.company_id:
             raise ValidationError("company_id mismatch between StockLedgerEntry and Part")
 
-        # Deterministic transaction_value
         if self.unit_cost is None:
             raise ValidationError("unit_cost is required")
         if self.qty is None:
             raise ValidationError("qty is required")
 
         self.full_clean()
+
+        qty_dec = Decimal(self.qty)
+        if self.movement_type in {self.MovementType.IN, self.MovementType.OUT} and qty_dec <= 0:
+            raise ValidationError("qty must be > 0 for movement_type in/out")
+        if self.movement_type == self.MovementType.ADJUSTMENT and qty_dec == 0:
+            raise ValidationError("qty must be non-zero for movement_type adjustment")
+
         self.transaction_value = (Decimal(self.qty) * Decimal(self.unit_cost))
 
-        # App-level idempotency guard (fast-path): v2 first, then v1
         dup = self._find_idempotent_duplicate_v2() or self._find_idempotent_duplicate_v1()
         if dup:
             self.id = dup.id
@@ -295,10 +356,32 @@ class StockLedgerEntry(models.Model):
 
         is_new = self._state.adding
 
-        # DB-level safety guard (race condition): unique indexes may raise IntegrityError
         try:
             with transaction.atomic():
+                delta = self._movement_delta_qty()
+                if delta < 0:
+                    self._acquire_part_xact_lock()
+                    current = self._current_available_qty_locked()
+                    projected = current + delta
+                    if projected < 0:
+                        raise ValidationError("negative stock not allowed (ledger-time guard)")
+
                 result = super().save(*args, **kwargs)
+
+        except ValidationError as exc:
+            if "negative stock not allowed (ledger-time guard)" in str(exc):
+                try:
+                    delta = self._movement_delta_qty()
+                    current = self._current_available_qty_locked()
+                    projected = current + delta
+                except Exception:
+                    delta = self._movement_delta_qty()
+                    current = Decimal("0")
+                    projected = Decimal("0")
+
+                self._emit_negative_stock_block_audit(current=current, delta=delta, projected=projected)
+            raise
+
         except IntegrityError:
             dup2 = self._find_idempotent_duplicate_v2() or self._find_idempotent_duplicate_v1()
             if dup2:
@@ -308,7 +391,6 @@ class StockLedgerEntry(models.Model):
                 return None
             raise
 
-        # IMPORTANT: local import to avoid circular import at startup
         if is_new:
             from apps.inventory.hooks import on_ledger_insert
 
