@@ -1,3 +1,4 @@
+# apps/inventory/models.py
 from __future__ import annotations
 
 from decimal import Decimal
@@ -333,24 +334,34 @@ class StockLedgerEntry(models.Model):
         if self.idempotency_key and not self.idempotency_scope:
             raise ValidationError("idempotency_scope is required when idempotency_key is provided")
 
-        # D-3.27 — Reverse semantics (fail-fast)
+        # D-3.28 — Reverse semantics & guards (fail-fast)
         if self.reverse_of_id:
             if self.reverse_of_id == self.id:
                 raise ValidationError("reverse_of cannot point to itself")
 
-            orig = self.reverse_of  # resolved by Django (FK cache)
+            orig = self.reverse_of  # resolved by Django
+
+            # tenant boundary + part boundary
             if orig.company_id != self.company_id:
                 raise ValidationError("company_id mismatch between reverse entry and original entry")
+            if orig.part_id != self.part_id:
+                raise ValidationError("part mismatch between reverse entry and original entry")
 
             # single-step: do not allow reversing a reverse entry
             if getattr(orig, "reverse_of_id", None):
                 raise ValidationError("cannot reverse a reverse entry")
 
-            # reverse rows must be adjustment source (traceable correction lane)
+            # correction lane must be traceable
             if self.source_type != self.SourceType.ADJUSTMENT:
                 raise ValidationError("reverse entries must use source_type=adjustment")
 
-            # movement rule
+            # delta inversion (canonical rule)
+            expected = Decimal(orig._movement_delta_qty()) * Decimal("-1")
+            actual = Decimal(self._movement_delta_qty())
+            if actual != expected:
+                raise ValidationError("reverse entry must invert original stock delta (delta must be -original_delta)")
+
+            # movement normalization rules (deterministic encoding)
             if orig.movement_type == self.MovementType.IN:
                 if self.movement_type != self.MovementType.OUT:
                     raise ValidationError("reverse of an IN must be an OUT")
@@ -362,7 +373,6 @@ class StockLedgerEntry(models.Model):
                 if Decimal(self.qty) != Decimal(orig.qty):
                     raise ValidationError("reverse qty must match original qty for IN/OUT")
             else:
-                # adjustment reversed by adjustment with -qty
                 if self.movement_type != self.MovementType.ADJUSTMENT:
                     raise ValidationError("reverse of an ADJUSTMENT must be an ADJUSTMENT")
                 if Decimal(self.qty) != (Decimal(orig.qty) * Decimal("-1")):
@@ -400,33 +410,27 @@ class StockLedgerEntry(models.Model):
             return None
 
         is_new = self._state.adding
+        neg_block_info: tuple[Decimal, Decimal, Decimal] | None = None
 
         try:
             with transaction.atomic():
                 delta = self._movement_delta_qty()
 
-                # D-3.25 — Negative stock guard:
-                # reverse/correction entries are an explicit exception lane (spec) -> do not block.
-                if delta < 0 and not self.reverse_of_id:
+                # D-3.25 — Negative stock guard (ledger-time, fail-closed)
+                # Applies to ANY entry that would reduce available stock (including reverse, if it ever reduces).
+                if delta < 0:
                     self._acquire_part_xact_lock()
                     current = self._current_available_qty_locked()
                     projected = current + delta
                     if projected < 0:
+                        neg_block_info = (current, Decimal(delta), projected)
                         raise ValidationError("negative stock not allowed (ledger-time guard)")
 
                 result = super().save(*args, **kwargs)
 
-        except ValidationError as exc:
-            if "negative stock not allowed (ledger-time guard)" in str(exc):
-                try:
-                    delta = self._movement_delta_qty()
-                    current = self._current_available_qty_locked()
-                    projected = current + delta
-                except Exception:
-                    delta = self._movement_delta_qty()
-                    current = Decimal("0")
-                    projected = Decimal("0")
-
+        except ValidationError:
+            if neg_block_info is not None:
+                current, delta, projected = neg_block_info
                 self._emit_negative_stock_block_audit(current=current, delta=delta, projected=projected)
             raise
 
