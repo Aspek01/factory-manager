@@ -1,3 +1,4 @@
+# apps/audit/constants.py
 from __future__ import annotations
 
 # ============================================================
@@ -40,6 +41,17 @@ REQUIRED_PAYLOAD_KEYS: dict[str, set[str]] = {
         "delta_qty",
         "current_available_qty",
         "projected_available_qty",
+        "unit_cost",
+        "source_ref",
+    },
+
+    # D-3.29: Reverse duplicate block audit (double-reverse protection)
+    "inventory.reverse.duplicate_blocked": {
+        "reverse_of_id",
+        "part_id",
+        "movement_type",
+        "source_type",
+        "qty",
         "unit_cost",
         "source_ref",
     },

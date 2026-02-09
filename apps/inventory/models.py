@@ -243,6 +243,10 @@ class StockLedgerEntry(models.Model):
         )
 
     def _find_idempotent_duplicate_v1(self) -> "StockLedgerEntry | None":
+        """
+        D-3.29: include reverse_of in logical key to make reverse writes deterministic
+        and prevent accidental collapse with unrelated adjustment rows.
+        """
         if not self._state.adding:
             return None
 
@@ -256,6 +260,7 @@ class StockLedgerEntry(models.Model):
                 unit_cost=self.unit_cost,
                 reference_price=self.reference_price,
                 source_ref=self.source_ref,
+                reverse_of_id=self.reverse_of_id,
             )
             .only("id", "created_at")
             .first()
@@ -328,6 +333,38 @@ class StockLedgerEntry(models.Model):
         except Exception:
             return
 
+    def _emit_reverse_duplicate_block_audit(self, *, reverse_of_id: str, existing_reverse_id: str | None) -> None:
+        """
+        D-3.29: Emit audit for double-reverse attempt (fail-closed).
+        Best-effort: audit failure must not mask ValidationError.
+        """
+
+        class _Ctx:
+            def __init__(self, company_id):
+                self.company_id = company_id
+                self.is_system = False
+
+        ctx = _Ctx(self.company_id)
+
+        try:
+            emit_audit_event(
+                event_name="inventory.reverse.duplicate_blocked",
+                payload={
+                    "reverse_of_id": str(reverse_of_id),
+                    "existing_reverse_id": str(existing_reverse_id) if existing_reverse_id else None,
+                    "part_id": str(self.part_id),
+                    "movement_type": str(self.movement_type),
+                    "source_type": str(self.source_type),
+                    "qty": str(self.qty),
+                    "unit_cost": str(self.unit_cost),
+                    "source_ref": self.source_ref or {},
+                },
+                context=ctx,
+                actor_id=None,
+            )
+        except Exception:
+            return
+
     def clean(self):
         super().clean()
 
@@ -350,6 +387,15 @@ class StockLedgerEntry(models.Model):
             # single-step: do not allow reversing a reverse entry
             if getattr(orig, "reverse_of_id", None):
                 raise ValidationError("cannot reverse a reverse entry")
+
+            # D-3.29 — Double-reverse protection (fail-closed)
+            existing = (
+                StockLedgerEntry.objects.filter(reverse_of_id=self.reverse_of_id)
+                .only("id")
+                .first()
+            )
+            if existing and (self._state.adding or existing.id != self.id):
+                raise ValidationError("reverse_of already has a reverse entry")
 
             # correction lane must be traceable
             if self.source_type != self.SourceType.ADJUSTMENT:
@@ -392,7 +438,24 @@ class StockLedgerEntry(models.Model):
         if self.qty is None:
             raise ValidationError("qty is required")
 
-        self.full_clean()
+        # Deterministic transaction_value (needs qty/unit_cost present)
+        self.transaction_value = (Decimal(self.qty) * Decimal(self.unit_cost))
+
+        # Full validation; emit audit on specific fail-closed blocks
+        try:
+            self.full_clean()
+        except ValidationError as exc:
+            if "reverse_of already has a reverse entry" in str(exc):
+                existing_reverse_id = (
+                    StockLedgerEntry.objects.filter(reverse_of_id=self.reverse_of_id)
+                    .values_list("id", flat=True)
+                    .first()
+                )
+                self._emit_reverse_duplicate_block_audit(
+                    reverse_of_id=str(self.reverse_of_id),
+                    existing_reverse_id=str(existing_reverse_id) if existing_reverse_id else None,
+                )
+            raise
 
         qty_dec = Decimal(self.qty)
         if self.movement_type in {self.MovementType.IN, self.MovementType.OUT} and qty_dec <= 0:
@@ -400,8 +463,7 @@ class StockLedgerEntry(models.Model):
         if self.movement_type == self.MovementType.ADJUSTMENT and qty_dec == 0:
             raise ValidationError("qty must be non-zero for movement_type adjustment")
 
-        self.transaction_value = (Decimal(self.qty) * Decimal(self.unit_cost))
-
+        # App-level idempotency guard (fast-path): v2 first, then v1
         dup = self._find_idempotent_duplicate_v2() or self._find_idempotent_duplicate_v1()
         if dup:
             self.id = dup.id
@@ -435,6 +497,7 @@ class StockLedgerEntry(models.Model):
             raise
 
         except IntegrityError:
+            # DB-level races: try to resolve deterministic duplicates
             dup2 = self._find_idempotent_duplicate_v2() or self._find_idempotent_duplicate_v1()
             if dup2:
                 self.id = dup2.id

@@ -1,3 +1,4 @@
+# apps/audit/events.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -52,6 +53,11 @@ EVENTS: Dict[str, AuditEventSpec] = {
         notes="Ledger-time negative stock attempt blocked (fail-closed).",
     ),
 
+    # --- inventory / reverse guards ---
+    "inventory.reverse.duplicate_blocked": AuditEventSpec(
+        name="inventory.reverse.duplicate_blocked",
+        notes="Attempt to reverse the same ledger entry more than once blocked (fail-closed).",
+    ),
 }
 
 
